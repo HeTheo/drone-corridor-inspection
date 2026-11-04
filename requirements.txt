@@ -1,0 +1,13 @@
+# 机载电脑（Orange Pi 4 Pro / aarch64 / Ubuntu 22.04 / Python 3.10）实测版本
+# 安装：pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 飞控通信（必须 < 4，4.x 接口不兼容）
+mavsdk==3.17.4
+grpcio==1.84.0
+
+# 雷达串口
+pyserial==3.5
+
+# 视觉推理（摄像头 + ONNX）
+opencv-python==5.0.0.93
+numpy==2.2.6
