@@ -1,0 +1,1 @@
+source ~/drone/venv/bin/activate

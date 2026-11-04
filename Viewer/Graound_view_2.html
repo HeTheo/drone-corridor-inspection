@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>走廊巡检 · 多层楼模拟（10层，消防栓随机状态）</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0f14;overflow:hidden;
+    color:#8ff;font:13px ui-monospace,monospace}
+  canvas{display:block}
+  #dataTable{position:fixed;top:12px;left:14px;z-index:3;
+    border-collapse: collapse;color:#8ff;font-size:12px;background:#0b0f1490;}
+  #dataTable th,#dataTable td{border:1px solid #2a3a49;padding:4px 8px;text-align:center;}
+  #dataTable th{color:#39ff88}
+  #legend{position:fixed;right:16px;bottom:16px;z-index:2;line-height:1.7;
+    text-align:right;color:#5a7a8a;font-size:12px}
+  #ctrl{position:fixed;left:14px;bottom:14px;z-index:2;display:flex;gap:6px;flex-wrap:wrap}
+  button{background:#16212b;color:#8ff;border:1px solid #2a3a49;border-radius:6px;
+    padding:6px 12px;font:inherit;cursor:pointer}
+  button:hover{background:#1e2c38}
+  select{background:#16212b;color:#8ff;border:1px solid #2a3a49;border-radius:6px;padding:6px;}
+</style>
+</head>
+<body>
+<table id="dataTable">
+  <tr>
+    <th>参数</th>
+    <th>数值</th>
+  </tr>
+  <tr>
+    <td>楼层</td>
+    <td id="floorVal">5F</td>
+  </tr>
+  <tr>
+    <td>飞行速度(m/s)</td>
+    <td id="spVal">0.00</td>
+  </tr>
+  <tr>
+    <td>高度(m)</td>
+    <td id="altVal">0.00</td>
+  </tr>
+  <tr>
+    <td>距墙距离(m)</td>
+    <td id="wallDistVal">0.00</td>
+  </tr>
+  <tr>
+    <td>横向误差(cm)</td>
+    <td id="errVal">0</td>
+  </tr>
+  <tr>
+    <td>沿走廊E(m)</td>
+    <td id="eastVal">0.00</td>
+  </tr>
+  <tr>
+    <td>航向(°)</td>
+    <td id="yawVal">0.00</td>
+  </tr>
+    <tr>
+    <td>已确认</td>
+    <td id="hydCnt">0 / 3</td>
+  </tr>
+  <tr>
+    <td>完好消防栓</td>
+    <td id="okHyd">0</td>
+  </tr>
+  <tr>
+    <td>异常消防栓</td>
+    <td id="badHyd">0</td>
+  </tr>
+</table>
+<div id="mode" style="position:fixed;top:12px;right:16px;z-index:5;
+     font:bold 13px monospace;padding:5px 12px;border-radius:6px;
+     background:#16212b;border:1px solid #2a3a49;color:#5a7a8a">DEMO</div>
+<div id="legend">
+  ▲ 机头 / 雷达 0° / 摄像头 都朝墙<br>
+  → 机身侧飞方向<br>
+  ● 灰=未检　● 黄=已检　● 绿=齐全　● 红=缺件<br>
+  🔥 消防栓：距起飞点 2.4 / 18.5 / 34.5 m（走廊全长 40 m）
+</div>
+<div id="ctrl">
+  <button id="btnPlay">⏸ 暂停</button>
+  <button id="btnReset">↻ 重置本层</button>
+  <button id="btnFloorUp">⬆ 上一层</button>
+  <button id="btnFloorDown">⬇ 下一层</button>
+  <select id="floorSelect"></select>
+</div>
+<canvas id="cv"></canvas>
+<script>
+// ================== 场景参数【走廊宽 2.49m，总长 40m】==================
+const CORRIDOR_LEN = 40.0;                 // 走廊总长（m）
+const CORRIDOR_POLY = [
+  [-1.245, 0], [1.245, 0], [1.245, CORRIDOR_LEN], [-1.245, CORRIDOR_LEN]
+];
+const WALL_N = 1.245;
+const TARGET_DIST = 1.65;
+
+// 消防栓位置：距起飞点（east = 0）的米数
+const HYDRANT_POS = [2.4, 18.5, 34.5];
+
+// 楼层切换判定点（保留常量，仅为不影响楼层按钮逻辑）
+const FLOOR_SWITCH_EAST = CORRIDOR_LEN - 1.0;
+
+const CAM_HALF_FOV = 25.0;
+const CRUISE_SPEED = 0.5;
+
+//楼层全局
+let currentFloor = 5;
+const FLOOR_MIN = 1;
+const FLOOR_MAX = 10;
+
+// 生成一层消防栓状态：完好概率50%~100%，每层独立随机
+function genFloorHydrants(){
+  const hydList = [];
+  const goodProb = 0.5 + Math.random()*0.5;
+  for(let i=0;i<HYDRANT_POS.length;i++){
+    const status = Math.random() < goodProb ? "ok" : "missing";
+    hydList.push({
+      east:HYDRANT_POS[i],
+      status:status,
+      detected:false
+    });
+  }
+  return hydList;
+}
+let hydrants = genFloorHydrants();
+
+// 下拉框初始化
+const floorSel = document.getElementById("floorSelect");
+for(let f=FLOOR_MIN;f<=FLOOR_MAX;f++){
+  const opt = document.createElement("option");
+  opt.value = f;
+  opt.textContent = f+"F";
+  floorSel.appendChild(opt);
+}
+floorSel.value = currentFloor;
+floorSel.onchange = ()=>jumpFloor(parseInt(floorSel.value));
+
+// 切换楼层函数
+function jumpFloor(newFloor){
+  if(newFloor < FLOOR_MIN || newFloor > FLOOR_MAX) return;
+  currentFloor = newFloor;
+  hydrants = genFloorHydrants();
+  drone.east = 0;
+  t=0;
+  trail.length=0;
+  document.getElementById('floorVal').innerText = `${currentFloor}F`;
+  floorSel.value = currentFloor;
+}
+
+function changeFloor(delta){
+  if(drone.east < FLOOR_SWITCH_EAST - 2){
+    alert("⚠ 需要飞到走廊末端出口，才能上下切换楼层！下拉框可以直接跳转演示");
+    return;
+  }
+  jumpFloor(currentFloor + delta);
+}
+
+// 重置当前层：无人机回到起点，消防栓状态保留（本层已随机生成的不变）
+function resetCurrentFloor(){
+  t = 0; done = false; playing = true;
+  drone.north = drone.east = drone.down = drone.yaw = 0;
+  droneSpeed = 0;
+  trail.length = 0;
+  // 重置检测状态，但保留本层随机生成的消防栓好坏结果
+  hydrants.forEach(h => h.detected = false);
+  document.getElementById('btnPlay').textContent = '⏸ 暂停';
+  document.getElementById('floorVal').innerText = `${currentFloor}F`;
+  floorSel.value = currentFloor;
+}
+
+//包围盒
+const NS = CORRIDOR_POLY.map(p=>p[0]), ES = CORRIDOR_POLY.map(p=>p[1]);
+const N_MIN=Math.min(...NS), N_MAX=Math.max(...NS);
+const E_MIN=Math.min(...ES), E_MAX=Math.max(...ES);
+const CN=(N_MIN+N_MAX)/2, CE=(E_MIN+E_MAX)/2;
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let scale = 1, ox = 0, oy = 0;
+
+function fit(){
+  cv.width = innerWidth; cv.height = innerHeight;
+  const padX = 180, padY = 140;
+  scale = Math.min((cv.width - padX*2)/(E_MAX-E_MIN),
+                   (cv.height - padY*2)/(N_MAX-N_MIN));
+  ox = cv.width/2  - CE*scale;
+  oy = cv.height/2 + CN*scale;
+}
+addEventListener('resize', fit);
+const toPx = (n, e) => [ox + e*scale, oy - n*scale];
+
+//无人机状态
+const drone = { north:0, east:0, down:0, yaw:0 };
+const trail = [];
+let t = 0, playing = true, done = false, lastTs = performance.now();
+let droneSpeed = 0;
+// ================= 真实数据接入 =================
+let LIVE_MODE = false;
+let lastPos = null;
+
+const ws = new WebSocket(`ws://${location.host}/ws`);
+ws.onopen  = () => console.log("WS 已连接");
+ws.onmessage = (e)=>{
+  if (!LIVE_MODE){
+    LIVE_MODE = true;
+    hydrants.forEach(h=>{ h.status='unknown'; h.detected=false; });
+    const el = document.getElementById('mode');
+    el.textContent = 'LIVE'; el.style.color = '#39ff88';
+    console.log('[WS] 收到真实数据，切到 LIVE');
+  }
+  handleMsg(JSON.parse(e.data));
+};
+
+ws.onclose = () => {
+  LIVE_MODE = false;
+  const el = document.getElementById('mode');
+  el.textContent = 'DEMO'; el.style.color = '#5a7a8a';
+  console.warn("WS 断开，切回模拟");
+};
+
+function handleMsg(m){
+  if (m.type === 'pos'){
+    const now = performance.now();
+    if (lastPos && now > lastPos.t){     // 由位置差分估速度
+      const dt = (now - lastPos.t)/1000;
+      const dn = m.north - lastPos.n, de = m.east - lastPos.e;
+      droneSpeed = Math.hypot(dn, de)/dt;
+    }
+    lastPos = { n:m.north, e:m.east, t:now };
+
+    drone.north = m.north;
+    drone.east  = m.east;
+    drone.down  = m.down;
+    drone.yaw   = m.yaw;
+
+    if (typeof m.hyd === 'number')           // ★ 新增：已确认个数
+      document.getElementById('hydCnt').innerText = m.hyd + ' / 3';
+  } else if (m.type === 'det'){
+    if (typeof m.index === 'number' && hydrants[m.index]){
+      // ★ 有 index：把这个栓直接挪到实测位置，演示时永远对得上
+      const h = hydrants[m.index];
+      h.east     = m.east;
+      h.status   = m.status;        // 'ok' | 'missing'
+      h.detected = true;
+    } else {
+      let best=null, bd=1e9;
+      hydrants.forEach(h=>{
+        const d = Math.abs(h.east - m.east);
+        if (d < bd){ bd=d; best=h; }
+      });
+      if (best && bd < 2.0) best.status = m.status;
+    }
+  }
+}
+// ================================================
+
+function update(dt){
+  if (LIVE_MODE) return;        // ← 新增：有真实数据就不跑假动作
+  if (!playing || done) return;
+  t += dt;
+  const T_TAKEOFF = 3, T_HOVER = 5;
+  if (t < T_TAKEOFF){
+    drone.down = -2.5*(t/T_TAKEOFF); drone.north = 0; drone.yaw = 0;
+    droneSpeed = 0;
+  } else if (t < T_HOVER){
+    drone.down = -2.5;
+    drone.north = Math.sin(t*1.5)*0.05;
+    drone.yaw = Math.sin(t*1.0)*3;
+    droneSpeed = 0;
+  } else {
+    const ct = t - T_HOVER;
+    drone.east  = Math.min(E_MAX-2, ct*CRUISE_SPEED);
+    drone.down  = -2.5 + Math.sin(ct*1.2)*0.04;
+    drone.north = Math.sin(ct*0.9)*0.10;
+    drone.yaw   = Math.sin(ct*0.7)*4;
+    droneSpeed = CRUISE_SPEED;
+    if (drone.east >= E_MAX-2) {
+      done = true;
+      droneSpeed = 0;
+    }
+  }
+}
+
+function camHits(p){
+  const h = p.yaw*Math.PI/180, half = CAM_HALF_FOV*Math.PI/180, res = [];
+  [-half, +half].forEach(d=>{
+    const a = h+d, c = Math.cos(a);
+    if (c <= 0.05) return;
+    res.push(p.east + (WALL_N - p.north)/c * Math.sin(a));
+  });
+  return res;
+}
+
+//绘制
+function drawCorridor(){
+  ctx.beginPath();
+  CORRIDOR_POLY.forEach(([n,e],i)=>{
+    const [x,y] = toPx(n,e);
+    i ? ctx.lineTo(x,y) : ctx.moveTo(x,y);
+  });
+  ctx.closePath();
+  ctx.fillStyle = '#121a22'; ctx.fill();
+  ctx.strokeStyle = '#2a3a49'; ctx.lineWidth = 2; ctx.stroke();
+
+  ctx.save(); ctx.clip();
+  ctx.strokeStyle = '#1a242e'; ctx.lineWidth = 1;
+  for (let e=Math.ceil(E_MIN); e<=E_MAX; e++){
+    const [gx] = toPx(0,e);
+    const [,y0] = toPx(N_MAX,0), [,y1] = toPx(N_MIN,0);
+    ctx.beginPath(); ctx.moveTo(gx,y0); ctx.lineTo(gx,y1); ctx.stroke();
+  }
+  for (let n=Math.ceil(N_MIN); n<=N_MAX; n++){
+    const [,gy] = toPx(n,0);
+    const [x0] = toPx(0,E_MIN), [x1] = toPx(0,E_MAX);
+    ctx.beginPath(); ctx.moveTo(x0,gy); ctx.lineTo(x1,gy); ctx.stroke();
+  }
+  ctx.restore();
+
+  //墙面
+  const [wx0,wy] = toPx(WALL_N, E_MIN);
+  const [wx1]   = toPx(WALL_N, E_MAX);
+  ctx.strokeStyle = '#5c6b7a'; ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.moveTo(wx0,wy); ctx.lineTo(wx1,wy); ctx.stroke();
+  ctx.fillStyle = '#7a8b9a'; ctx.font = '12px monospace';
+  ctx.fillText('墙（摄像头拍摄面）', wx0+8, wy-16);
+
+  //米标
+  ctx.fillStyle = '#3a4a5a'; ctx.font = '11px monospace';
+  const [,my] = toPx(N_MIN,0);
+  for (let e=Math.ceil(E_MIN/5)*5; e<=E_MAX; e+=5){
+    const [gx] = toPx(0,e);
+    ctx.fillText(e+'m', gx+4, my+18);
+  }
+}
+
+function drawHydrants(seen){
+  hydrants.forEach((h,i)=>{
+    const x = toPx(WALL_N, h.east)[0];
+    const y = toPx(WALL_N, h.east)[1];
+    let col = '#8a97a3', label = '未检';
+    if(!LIVE_MODE && seen.has(i)) h.detected = true;   // 真实模式只认 det 消息
+    if (h.detected){
+      if (h.status === 'ok')      { col = '#39ff88'; label = '✔ 齐全'; }
+      if (h.status === 'missing') { col = '#ff3b3b'; label = '✖ 缺件'; }
+      if (h.status === 'unknown') { col = '#ffd23f'; label = '● 已检'; }
+    }
+
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(x, y+12, 7, 0, Math.PI*2); ctx.fill();
+
+    if (seen.has(i)){
+      ctx.strokeStyle = 'rgba(90,200,255,.9)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, y+12, 13, 0, Math.PI*2); ctx.stroke();
+    }
+    if (h.detected && h.status === 'missing'){
+      ctx.strokeStyle = 'rgba(255,59,59,.5)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(x, y+12, 18, 0, Math.PI*2); ctx.stroke();
+    }
+    ctx.fillStyle = col; ctx.font = '11px monospace';
+    ctx.fillText(label, x-18, y+36);
+  });
+}
+
+function drawCamFOV(p, hits){
+  if (hits.length !== 2) return;
+  const [ax,ay] = toPx(p.north, p.east);
+  const [h1x,h1y] = toPx(WALL_N, hits[0]);
+  const [h2x,h2y] = toPx(WALL_N, hits[1]);
+  ctx.fillStyle = 'rgba(90,200,255,.10)';
+  ctx.beginPath(); ctx.moveTo(ax,ay);
+  ctx.lineTo(h1x,h1y); ctx.lineTo(h2x,h2y); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = 'rgba(90,200,255,.30)'; ctx.lineWidth = 1; ctx.stroke();
+}
+
+function drawLidar(p){
+  const dist = WALL_N - p.north;
+  const [x0,y0] = toPx(p.north, p.east);
+  const [x1,y1] = toPx(WALL_N, p.east);
+  ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = 1.5;
+  ctx.setLineDash([5,4]);
+  ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#ffd23f'; ctx.font = 'bold 12px monospace';
+  ctx.fillText(dist.toFixed(2)+'m', x1+6, (y0+y1)/2+4);
+  return dist;
+}
+
+function drawDrone(p){
+  const [x,y] = toPx(p.north, p.east);
+  trail.push([x,y]); if (trail.length > 4000) trail.shift();
+  ctx.strokeStyle = 'rgba(57,255,136,.30)'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  trail.forEach(([tx,ty],i)=> i?ctx.lineTo(tx,ty):ctx.moveTo(tx,ty));
+  ctx.stroke();
+
+  ctx.save(); ctx.translate(x,y); ctx.rotate(p.yaw*Math.PI/180);
+  ctx.shadowColor = '#39ff88'; ctx.shadowBlur = 12; ctx.fillStyle = '#39ff88';
+  ctx.beginPath();
+  ctx.moveTo(0,-11); ctx.lineTo(7,9); ctx.lineTo(0,5); ctx.lineTo(-7,9);
+  ctx.closePath(); ctx.fill();
+  ctx.restore(); ctx.shadowBlur = 0;
+
+  ctx.strokeStyle = 'rgba(57,255,136,.55)'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x+16,y); ctx.lineTo(x+38,y);
+  ctx.lineTo(x+31,y-5); ctx.moveTo(x+38,y); ctx.lineTo(x+31,y+5);
+  ctx.stroke();
+}
+
+function drawAltitude(p){
+  const bx = cv.width-46, by0 = 90, by1 = cv.height-90, hmax = 4, h = -p.down;
+  ctx.fillStyle = '#121a22'; ctx.fillRect(bx, by0, 14, by1-by0);
+  ctx.strokeStyle = '#2a3a49'; ctx.strokeRect(bx, by0, 14, by1-by0);
+  const hy = by1 - (h/hmax)*(by1-by0);
+  ctx.fillStyle = '#39ff88'; ctx.fillRect(bx, hy, 14, by1-hy);
+  ctx.fillStyle = '#8ff'; ctx.font = '11px monospace';
+  ctx.fillText(h.toFixed(2)+'m', bx-48, hy+4);
+}
+
+function updateTable(p, dist){
+  const err = dist - TARGET_DIST;
+  const errCm = (err*100).toFixed(0);
+  const nOk = hydrants.filter(h=>h.detected && h.status==='ok').length;
+  const nBad = hydrants.filter(h=>h.detected && h.status==='missing').length;
+  document.getElementById('floorVal').innerText = `${currentFloor}F`;
+  document.getElementById('spVal').innerText = droneSpeed.toFixed(2);
+  document.getElementById('altVal').innerText = (-p.down).toFixed(2);
+  document.getElementById('wallDistVal').innerText = dist.toFixed(2);
+  document.getElementById('errVal').innerText = errCm;
+  document.getElementById('eastVal').innerText = p.east.toFixed(2);
+  document.getElementById('yawVal').innerText = p.yaw.toFixed(1);
+  document.getElementById('okHyd').innerText = nOk;
+  document.getElementById('badHyd').innerText = nBad;
+}
+
+function frame(ts){
+  const dt = Math.min(0.05,(ts-lastTs)/1000); lastTs = ts;
+  update(dt);
+  ctx.clearRect(0,0,cv.width,cv.height);
+
+  const hits = camHits(drone);
+  const seen = new Set();
+  if (hits.length === 2){
+    const lo = Math.min(...hits), hi = Math.max(...hits);
+    hydrants.forEach((h,i)=>{ if (h.east>=lo && h.east<=hi) seen.add(i); });
+  }
+
+  drawCorridor();
+  drawHydrants(seen);
+  drawCamFOV(drone, hits);
+  const dist = drawLidar(drone);
+  drawDrone(drone);
+  drawAltitude(drone);
+  updateTable(drone, dist);
+  requestAnimationFrame(frame);
+}
+
+document.getElementById('btnPlay').onclick = (e)=>{
+  playing = !playing;
+  e.target.textContent = playing ? '⏸ 暂停' : '▶ 播放';
+};
+document.getElementById('btnReset').onclick = resetCurrentFloor;
+document.getElementById('btnFloorUp').onclick = ()=> changeFloor(1);
+document.getElementById('btnFloorDown').onclick = ()=> changeFloor(-1);
+
+fit(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
