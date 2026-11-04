@@ -31,10 +31,26 @@ class LidarSample:
     yaw_err: float   # 机头与"墙法线"的夹角（弧度）；0 = 机头正对墙
     ok: bool         # 数据是否有效
 
+    # 机头【沿走廊】时，±90° 这两侧才是墙（2.49m 那条边）
+    left: float = float("nan")      # 左侧距离（米）
+    right: float = float("nan")     # 右侧距离（米）
+    side_ok: bool = False           # 左右两侧是否都有效
+
     @property
     def e_lat(self) -> float:
-        """横向误差（米）。>0 表示偏向机头那一面墙"""
+        """横向误差（米）。
+        < 0 : 更靠近 front 波束打的那面墙（前方太近 → 该后退）
+        > 0 : 更靠近 back 波束打的那面墙（前方太远 → 该前进）
+        """
         return (self.front - self.back) / 2.0
+
+    @property
+    def e_side(self) -> float:
+        """左右居中误差（米）—— 机头沿走廊时用。
+        > 0 : 偏左（right 比 left 大）→ 该往右走
+        < 0 : 偏右              → 该往左走
+        """
+        return self.right - self.left
 
 
 # ============================================================
@@ -126,7 +142,12 @@ class RealLidar:
     YAW_DELTA = 15         # 算 yaw 的两个子扇区中心（±15°）
     YAW_HALF = 5           # 子扇区半宽
     YAW_SIGN = -1.0        # 实测确认；若 yaw 修正方向反了，改成 -1.0
-    SMOOTH_N = 5           # 时间平滑窗口（近 5 圈取中位数）
+    SMOOTH_N = 2           # 时间平滑窗口（近 2 圈取中位数）
+    # ⚠️ 方向必须实测确认：手推飞机向"左"平移，left 应该【变小】。
+    #    如果反了，把 LEFT_DEG / RIGHT_DEG 两个值互换即可。
+    LEFT_DEG  = 270         # 左侧
+    RIGHT_DEG = 90        # 右侧（等效 -90°）
+    SIDE_HALF = 20         # 左右扇区半宽（度）；觉得噪音大就降到 10
 
     def __init__(self, port, model="N10"):
         if serial is None:
@@ -138,6 +159,9 @@ class RealLidar:
         self._hf = deque(maxlen=self.SMOOTH_N)
         self._hb = deque(maxlen=self.SMOOTH_N)
         self._hy = deque(maxlen=self.SMOOTH_N)
+        # ---- 新增：左右平滑窗口 ----
+        self._hl = deque(maxlen=self.SMOOTH_N)
+        self._hr = deque(maxlen=self.SMOOTH_N)
         threading.Thread(target=self._loop, daemon=True).start()
 
     def read(self, dt=0.05):
@@ -189,9 +213,16 @@ class RealLidar:
         dp = _median_m(_sector(buf, +self.YAW_DELTA, self.YAW_HALF))
         dm = _median_m(_sector(buf, -self.YAW_DELTA, self.YAW_HALF))
 
+        # ---- 新增：左右两侧 ----
+        l_raw = _median_m(_sector(buf, self.LEFT_DEG,  self.SIDE_HALF))
+        r_raw = _median_m(_sector(buf, self.RIGHT_DEG, self.SIDE_HALF))
+
         if not math.isnan(f): self._hf.append(f)
         if not math.isnan(b): self._hb.append(b)
+        if not math.isnan(l_raw): self._hl.append(l_raw)   # 新增
+        if not math.isnan(r_raw): self._hr.append(r_raw)   # 新增
         ff, bb = _median_deque(self._hf), _median_deque(self._hb)
+        ll, rr = _median_deque(self._hl), _median_deque(self._hr)  # 新增
 
         # yaw 偏角（小角度近似）：
         #   机头正对墙时 d(+Δ) == d(-Δ)；偏了就会一大一小
@@ -204,10 +235,11 @@ class RealLidar:
             ye = _median_deque(self._hy)
 
         ok = not (math.isnan(ff) or math.isnan(bb))
+        side_ok = not (math.isnan(ll) or math.isnan(rr))     # 新增
         with self._lock:
-            self._latest = LidarSample(ff, bb, ye, ok)
+            self._latest = LidarSample(ff, bb, ye, ok, ll, rr, side_ok)
 
-
+            
 # ============================================================
 #  工厂：仿真/真机切换只改这一行
 # ============================================================
